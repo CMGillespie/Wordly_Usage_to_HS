@@ -1,0 +1,12 @@
+wordly_creds.txt
+HS_Service_key.txt
+slack_webhook.txt
+wordly_session_state.json
+DATA/
+UPLOAD/
+PROCESSED/
+downloads/
+archive/
+*.csv
+__pycache__/
+.env
