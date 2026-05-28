@@ -12,7 +12,7 @@ from datetime import datetime
 from playwright.sync_api import sync_playwright
 
 # --- CONFIGURATION ---
-BASE_DIR = '/Users/cmgillespie/Library/CloudStorage/GoogleDrive-chris.gillespie@wordly.ai/My Drive/Code/Wordly_Usage_to_HS'
+BASE_DIR = '/Users/chriswork/Documents/Wordly_Usage_to_HS'
 CREDS_FILE = os.path.join(BASE_DIR, 'wordly_creds.txt')
 SESSION_FILE = os.path.join(BASE_DIR, 'wordly_session_state.json')
 GCS_BUCKET = 'wordly_usage_2_hs'
@@ -28,7 +28,7 @@ def get_credentials():
 def upload_to_gcs(local_path, gcs_dest):
     print(f'   📤 Uploading session state to {gcs_dest}...')
     result = subprocess.run(
-        ['gsutil', 'cp', local_path, gcs_dest],
+        ['gcloud', 'storage', 'cp', local_path, gcs_dest],
         capture_output=True, text=True
     )
     if result.returncode == 0:
