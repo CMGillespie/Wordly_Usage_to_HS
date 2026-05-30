@@ -10,3 +10,4 @@ archive/
 *.csv
 __pycache__/
 .env
+logs/*.log
