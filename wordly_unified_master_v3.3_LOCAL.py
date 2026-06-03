@@ -412,6 +412,16 @@ def run_v3_3_local():
             bq_df.columns = [c.replace(' ', '_') for c in bq_df.columns]
             bq_df['snapshot_date'] = pd.to_datetime('today').date()
 
+            # Delete today's rows before inserting — prevents duplicates on reruns
+            from google.cloud import bigquery
+            bq_client = bigquery.Client(project='support-467322')
+            today = bq_df['snapshot_date'].iloc[0]
+            bq_client.query(f"""
+                DELETE FROM `support-467322.wordly_usage_data.usage_history`
+                WHERE snapshot_date = '{today}'
+            """).result()
+            print(f"   🗑️ Cleared existing rows for {today}")
+
             pandas_gbq.to_gbq(
                 bq_df,
                 'wordly_usage_data.usage_history',
