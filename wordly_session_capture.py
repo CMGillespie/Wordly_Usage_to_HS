@@ -12,7 +12,7 @@ from datetime import datetime
 from playwright.sync_api import sync_playwright
 
 # --- CONFIGURATION ---
-BASE_DIR = '/Users/chriswork/Documents/Wordly_Usage_to_HS'
+BASE_DIR = '/Users/wordly_apps/Documents/Code/Wordly_Usage_to_HS'
 CREDS_FILE = os.path.join(BASE_DIR, 'wordly_creds.txt')
 SESSION_FILE = os.path.join(BASE_DIR, 'wordly_session_state.json')
 GCS_BUCKET = 'wordly_usage_2_hs'
