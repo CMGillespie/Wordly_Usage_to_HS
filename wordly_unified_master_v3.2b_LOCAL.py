@@ -1,13 +1,11 @@
 print("🚀 [HEARTBEAT] SCRIPT IS STARTING NOW...")
-# wordly_unified_master_v3.2b_LOCAL.py
-# VERSION: 3.2b-LOCAL
+# wordly_unified_master_v3.3_LOCAL.py
+# VERSION: 3.3-LOCAL
 # MACHINE: MacBook Air M1 — wordly_apps@Kirks-MacBook-Air
-# CHANGES FROM v3.2b-CLOUD:
-#   - Paths updated for local M1 environment
-#   - CSV output goes to GDrive UPLOAD folder for HubSpot import pickup
-#   - headless=False so browser is visible for MFA if session expires
-#   - Session state loaded from local file, falls back to manual login
-#   - BQ write uses local gcloud ADC credentials
+# CHANGES FROM v3.2b-LOCAL:
+#   - Added company name fetch from HubSpot (name property)
+#   - Added hs_company_name column to both CSV and BQ output
+#   - Enables company-level rollup views in Looker
 
 import os
 import glob
@@ -210,8 +208,8 @@ def get_sanitized_history(target_days):
         return pd.Series(dtype=float)
 
 
-def run_v3_2b_local():
-    print(f"🚀 Launching v3.2b-LOCAL at {datetime.now().strftime('%H:%M:%S')}")
+def run_v3_3_local():
+    print(f"🚀 Launching v3.3-LOCAL at {datetime.now().strftime('%H:%M:%S')}")
 
     current_uploads = glob.glob(os.path.join(UPLOAD_DIR, "*.csv"))
     for f in current_uploads:
@@ -229,7 +227,6 @@ def run_v3_2b_local():
     downloaded_files = []
 
     with sync_playwright() as p:
-        # headless=False — visible browser, handles MFA if session expires
         browser = p.chromium.launch(headless=False)
         context = browser.new_context(accept_downloads=True)
 
@@ -240,7 +237,6 @@ def run_v3_2b_local():
         if session_loaded:
             page.goto("https://portal.wordly.ai", wait_until="networkidle")
             page.wait_for_timeout(3000)
-            # Click through the landing page if present
             try:
                 btn = page.locator("#portal-login-btn-signin-wordly")
                 if btn.count() > 0:
@@ -270,7 +266,6 @@ def run_v3_2b_local():
             page.fill("#password", password)
             page.click("#kc-login")
 
-            # Wait for MFA completion — up to 5 minutes
             print("   ⏳ Waiting for MFA completion...")
             try:
                 page.wait_for_selector("app-root", timeout=300000)
@@ -343,7 +338,8 @@ def run_v3_2b_local():
                 if c['properties'].get('email')
             }
 
-            raw_companies = fetch_hs_objects(token, "companies", ["domain", "hubspot_owner_id"])
+            # Companies — now includes name
+            raw_companies = fetch_hs_objects(token, "companies", ["domain", "hubspot_owner_id", "name"])
             companies = {
                 c['properties']['domain'].lower(): c['id']
                 for c in raw_companies
@@ -354,6 +350,11 @@ def run_v3_2b_local():
                 for c in raw_companies
                 if c['properties'].get('domain')
             }
+            company_name_map = {
+                c['properties']['domain'].lower(): c['properties'].get('name', '') or ''
+                for c in raw_companies
+                if c['properties'].get('domain')
+            }
 
             hs_owner_name_map = fetch_hs_owner_map(token)
 
@@ -361,6 +362,7 @@ def run_v3_2b_local():
             master_df["Company ID"] = master_df["Owner Email"].str.lower().str.split('@').str[-1].map(companies)
             master_df["hs_owner_id"] = master_df["Owner Email"].str.lower().str.split('@').str[-1].map(company_owner_map)
             master_df["hs_account_owner"] = master_df["hs_owner_id"].map(hs_owner_name_map).fillna("")
+            master_df["hs_company_name"] = master_df["Owner Email"].str.lower().str.split('@').str[-1].map(company_name_map).fillna("")
 
         master_df['MK'] = master_df['Contact ID'].fillna(master_df['Owner Email'].str.lower())
         agg_rules = {
@@ -375,7 +377,8 @@ def run_v3_2b_local():
             'Contact ID': 'first',
             'Company ID': 'first',
             'hs_owner_id': 'first',
-            'hs_account_owner': 'first'
+            'hs_account_owner': 'first',
+            'hs_company_name': 'first'
         }
         master_df = master_df.groupby('MK').agg(agg_rules).reset_index()
 
@@ -392,8 +395,8 @@ def run_v3_2b_local():
         for col in ["Contact ID", "Company ID"]:
             master_df[col] = master_df[col].astype(str).str.replace(r'\.0$', '', regex=True).replace(['nan', 'None', ''], '')
 
-        # CSV — strip owner columns
-        csv_drop_cols = ['MK', 'hs_owner_id', 'hs_account_owner']
+        # CSV — strip internal reconciliation columns only
+        csv_drop_cols = ['MK', 'hs_owner_id', 'hs_account_owner', 'hs_company_name']
         final_path = os.path.join(UPLOAD_DIR, f"Wordly_Master_Import_{ts}.csv")
         master_df.drop(columns=[c for c in csv_drop_cols if c in master_df.columns]).to_csv(
             final_path, index=False, encoding='utf-8-sig'
@@ -409,6 +412,16 @@ def run_v3_2b_local():
             bq_df.columns = [c.replace(' ', '_') for c in bq_df.columns]
             bq_df['snapshot_date'] = pd.to_datetime('today').date()
 
+            # Delete today's rows before inserting — prevents duplicates on reruns
+            from google.cloud import bigquery
+            bq_client = bigquery.Client(project='support-467322')
+            today = bq_df['snapshot_date'].iloc[0]
+            bq_client.query(f"""
+                DELETE FROM `support-467322.wordly_usage_data.usage_history`
+                WHERE snapshot_date = '{today}'
+            """).result()
+            print(f"   🗑️ Cleared existing rows for {today}")
+
             pandas_gbq.to_gbq(
                 bq_df,
                 'wordly_usage_data.usage_history',
@@ -421,12 +434,12 @@ def run_v3_2b_local():
             print(f"⚠️ BigQuery Mirroring failed, but CSV is safe! Error: {e}")
         # --- END BIGQUERY ---
 
-        send_slack_message(f"v3.2b-LOCAL Success. Rows: {len(master_df)}", is_error=False)
+        send_slack_message(f"v3.3-LOCAL Success. Rows: {len(master_df)}", is_error=False)
         print(f"🎉 SUCCESS! Aggregated: {len(master_df)} rows")
     else:
-        send_slack_message("v3.2b-LOCAL: No files downloaded — check browser/session.", is_error=True)
+        send_slack_message("v3.3-LOCAL: No files downloaded — check browser/session.", is_error=True)
         print("❌ No files downloaded.")
 
 
 if __name__ == "__main__":
-    run_v3_2b_local()
+    run_v3_3_local()
