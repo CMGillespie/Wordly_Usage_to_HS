@@ -1,11 +1,13 @@
 print("🚀 [HEARTBEAT] SCRIPT IS STARTING NOW...")
-# wordly_unified_master_v3.3_LOCAL.py
-# VERSION: 3.3-LOCAL
+# wordly_unified_master_v3.2b_LOCAL.py
+# VERSION: v3.4-LOCAL
 # MACHINE: MacBook Air M1 — wordly_apps@Kirks-MacBook-Air
-# CHANGES FROM v3.2b-LOCAL:
-#   - Added company name fetch from HubSpot (name property)
-#   - Added hs_company_name column to both CSV and BQ output
-#   - Enables company-level rollup views in Looker
+# CHANGES FROM v3.3-LOCAL:
+#   - Added customer_success_manager to company fetch → hs_csm column in BQ
+#   - Added associatedcompanyid to contacts fetch → fallback company lookup for unmatched domains
+#   - Added company_id → name/owner/csm maps for fallback resolution
+#   - Slack message updated: v3.2b-LOCAL, Daily Account Usage Info captured
+#   - Named service = company name logic retained from v3.3
 
 import os
 import glob
@@ -33,12 +35,16 @@ SLACK_KEY_FILE = os.path.join(BASE_DIR, "slack_webhook.txt")
 
 EXCLUSION_KEYWORDS = ["Trial", "Intro", "Demo", "Test", "Free", "Wordly Internal"]
 
+GENERIC_SERVICES = {
+    'Active', 'Restricted', 'Trial', 'SMB Bronze', 'SMB Silver',
+    'SMB Gold', 'SMB Platinum', 'SMB Diamond', 'Wordly Workspace'
+}
+
 # Ensure folders exist
 for folder in [DATA_DIR, PROCESSED_DIR, ARCHIVE_DIR]:
     if not os.path.exists(folder):
         os.makedirs(folder)
 
-# GDrive UPLOAD folder — verify it exists and is accessible
 if os.path.exists(UPLOAD_DIR):
     print(f"   ✅ GDrive UPLOAD folder confirmed: {UPLOAD_DIR}")
 else:
@@ -81,7 +87,6 @@ def nuke_alert(page, location_name=""):
 
 
 def load_session_state(context):
-    """Load saved session state if available."""
     if os.path.exists(SESSION_FILE):
         print(f"   🔑 Session state found — loading...")
         with open(SESSION_FILE, "r") as f:
@@ -94,7 +99,6 @@ def load_session_state(context):
 
 
 def save_session_state(context):
-    """Save session state after successful login."""
     try:
         state = context.storage_state()
         with open(SESSION_FILE, "w") as f:
@@ -168,7 +172,6 @@ def fetch_hs_owner_map(token):
 
 
 def get_sanitized_history(target_days):
-    """Pull historical consumed mins from BQ snapshot closest to target_days ago."""
     try:
         import pandas_gbq
         from datetime import date, timedelta
@@ -204,16 +207,12 @@ def get_sanitized_history(target_days):
         return hdf.groupby('MK')['Consumed_Mins'].sum()
 
     except Exception as e:
-        print(f"   ⚠️ BQ history lookup failed: {e}")
+        print(f"   ⚠️ BQ history fetch failed: {e}")
         return pd.Series(dtype=float)
 
 
-def run_v3_3_local():
-    print(f"🚀 Launching v3.3-LOCAL at {datetime.now().strftime('%H:%M:%S')}")
-
-    current_uploads = glob.glob(os.path.join(UPLOAD_DIR, "*.csv"))
-    for f in current_uploads:
-        shutil.move(f, os.path.join(PROCESSED_DIR, os.path.basename(f)))
+def run_v3_4_local():
+    print(f"🚀 Launching v3.2b-LOCAL at {datetime.now().strftime('%H:%M:%S')}")
 
     with open(WORDLY_CREDS, "r") as f:
         raw_content = f.read().strip()
@@ -227,28 +226,24 @@ def run_v3_3_local():
     downloaded_files = []
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)
+        browser = p.chromium.launch(headless=True)
         context = browser.new_context(accept_downloads=True)
+        page = context.new_page()
 
         session_loaded = load_session_state(context)
 
-        page = context.new_page()
-
         if session_loaded:
-            page.goto("https://portal.wordly.ai", wait_until="networkidle")
-            page.wait_for_timeout(3000)
+            page.goto("https://portal.wordly.ai")
             try:
-                btn = page.locator("#portal-login-btn-signin-wordly")
-                if btn.count() > 0:
-                    btn.click(force=True)
-                    page.wait_for_timeout(3000)
+                page.wait_for_selector("#portal-login-btn-signin-wordly", timeout=5000)
+                page.click("#portal-login-btn-signin-wordly", force=True)
             except:
                 pass
             try:
-                page.wait_for_selector("app-root", timeout=8000)
+                page.wait_for_selector("app-root", timeout=15000)
                 print("   ✅ Session state valid — skipping login")
             except:
-                print("   ⚠️ Session expired — deleting stale session and doing full login")
+                print("   ⚠️ Session expired — falling back to full login")
                 if os.path.exists(SESSION_FILE):
                     os.remove(SESSION_FILE)
                 session_loaded = False
@@ -332,14 +327,27 @@ def run_v3_3_local():
             with open(HS_KEY_FILE, "r") as f:
                 token = f.read().strip()
 
+            # --- CONTACTS: fetch email + associatedcompanyid ---
+            raw_contacts = fetch_hs_objects(token, "contacts", ["email", "associatedcompanyid"])
             contacts = {
                 c['properties']['email'].lower(): c['id']
-                for c in fetch_hs_objects(token, "contacts", ["email"])
+                for c in raw_contacts
                 if c['properties'].get('email')
             }
+            # Map email → associated company ID for fallback lookup
+            contact_company_map = {
+                c['properties']['email'].lower(): str(c['properties'].get('associatedcompanyid', '') or '')
+                for c in raw_contacts
+                if c['properties'].get('email') and c['properties'].get('associatedcompanyid')
+            }
+            print(f"   ✅ Contact→company fallback map: {len(contact_company_map)} entries with company links")
 
-            # Companies — now includes name
-            raw_companies = fetch_hs_objects(token, "companies", ["domain", "hubspot_owner_id", "name"])
+            # --- COMPANIES: domain, owner, name, CSM ---
+            raw_companies = fetch_hs_objects(token, "companies", [
+                "domain", "hubspot_owner_id", "name", "customer_success_manager"
+            ])
+
+            # Domain-keyed maps (primary lookup)
             companies = {
                 c['properties']['domain'].lower(): c['id']
                 for c in raw_companies
@@ -355,14 +363,80 @@ def run_v3_3_local():
                 for c in raw_companies
                 if c['properties'].get('domain')
             }
+            company_csm_map = {
+                c['properties']['domain'].lower(): str(c['properties'].get('customer_success_manager', '') or '')
+                for c in raw_companies
+                if c['properties'].get('domain')
+            }
 
+            # Company ID-keyed maps (fallback lookup)
+            company_id_to_hs_id = {
+                c['id']: c['id']
+                for c in raw_companies
+            }
+            company_id_owner_map = {
+                c['id']: str(c['properties'].get('hubspot_owner_id', '') or '')
+                for c in raw_companies
+            }
+            company_id_name_map = {
+                c['id']: c['properties'].get('name', '') or ''
+                for c in raw_companies
+            }
+            company_id_csm_map = {
+                c['id']: str(c['properties'].get('customer_success_manager', '') or '')
+                for c in raw_companies
+            }
+
+            # Owner name resolution
             hs_owner_name_map = fetch_hs_owner_map(token)
 
+            # --- PRIMARY LOOKUPS (domain-based) ---
             master_df["Contact ID"] = master_df["Owner Email"].str.lower().map(contacts)
             master_df["Company ID"] = master_df["Owner Email"].str.lower().str.split('@').str[-1].map(companies)
             master_df["hs_owner_id"] = master_df["Owner Email"].str.lower().str.split('@').str[-1].map(company_owner_map)
             master_df["hs_account_owner"] = master_df["hs_owner_id"].map(hs_owner_name_map).fillna("")
             master_df["hs_company_name"] = master_df["Owner Email"].str.lower().str.split('@').str[-1].map(company_name_map).fillna("")
+            master_df["hs_csm_id"] = master_df["Owner Email"].str.lower().str.split('@').str[-1].map(company_csm_map).fillna("")
+            master_df["hs_csm"] = master_df["hs_csm_id"].map(hs_owner_name_map).fillna("")
+
+            # --- NAMED SERVICE FALLBACK for company name ---
+            master_df["hs_company_name"] = master_df.apply(
+                lambda row: row["hs_company_name"] if row["hs_company_name"] != ""
+                else (row["Service"] if row["Service"] not in GENERIC_SERVICES else ""),
+                axis=1
+            )
+
+            # --- CONTACT→COMPANY FALLBACK for unmatched domains ---
+            # For rows still missing Company ID, check if the contact has an associated company
+            unmatched_mask = master_df["Company ID"].isna() | (master_df["Company ID"] == "")
+            unmatched_count = unmatched_mask.sum()
+            if unmatched_count > 0:
+                print(f"   🔍 Running contact→company fallback for {unmatched_count} unmatched rows...")
+                fallback_resolved = 0
+
+                def apply_fallback(row):
+                    if not (pd.isna(row["Company ID"]) or row["Company ID"] == ""):
+                        return row
+                    email = str(row["Owner Email"]).lower().strip()
+                    assoc_company_id = contact_company_map.get(email, "")
+                    if not assoc_company_id:
+                        return row
+                    row["Company ID"] = assoc_company_id
+                    if not row["hs_account_owner"]:
+                        owner_id = company_id_owner_map.get(assoc_company_id, "")
+                        row["hs_owner_id"] = owner_id
+                        row["hs_account_owner"] = hs_owner_name_map.get(owner_id, "")
+                    if not row["hs_company_name"]:
+                        row["hs_company_name"] = company_id_name_map.get(assoc_company_id, "")
+                    if not row["hs_csm"]:
+                        csm_id = company_id_csm_map.get(assoc_company_id, "")
+                        row["hs_csm_id"] = csm_id
+                        row["hs_csm"] = hs_owner_name_map.get(csm_id, "")
+                    return row
+
+                master_df[unmatched_mask] = master_df[unmatched_mask].apply(apply_fallback, axis=1)
+                fallback_resolved = unmatched_mask.sum() - (master_df["Company ID"].isna() | (master_df["Company ID"] == "")).sum()
+                print(f"   ✅ Fallback resolved {fallback_resolved} additional company links")
 
         master_df['MK'] = master_df['Contact ID'].fillna(master_df['Owner Email'].str.lower())
         agg_rules = {
@@ -378,7 +452,9 @@ def run_v3_3_local():
             'Company ID': 'first',
             'hs_owner_id': 'first',
             'hs_account_owner': 'first',
-            'hs_company_name': 'first'
+            'hs_company_name': 'first',
+            'hs_csm_id': 'first',
+            'hs_csm': 'first',
         }
         master_df = master_df.groupby('MK').agg(agg_rules).reset_index()
 
@@ -395,8 +471,8 @@ def run_v3_3_local():
         for col in ["Contact ID", "Company ID"]:
             master_df[col] = master_df[col].astype(str).str.replace(r'\.0$', '', regex=True).replace(['nan', 'None', ''], '')
 
-        # CSV — strip internal reconciliation columns only
-        csv_drop_cols = ['MK', 'hs_owner_id', 'hs_account_owner', 'hs_company_name']
+        # CSV — strip internal reconciliation columns
+        csv_drop_cols = ['MK', 'hs_owner_id', 'hs_account_owner', 'hs_company_name', 'hs_csm_id', 'hs_csm']
         final_path = os.path.join(UPLOAD_DIR, f"Wordly_Master_Import_{ts}.csv")
         master_df.drop(columns=[c for c in csv_drop_cols if c in master_df.columns]).to_csv(
             final_path, index=False, encoding='utf-8-sig'
@@ -407,12 +483,11 @@ def run_v3_3_local():
         try:
             import pandas_gbq
 
-            bq_drop_cols = ['MK', 'hs_owner_id']
+            bq_drop_cols = ['MK', 'hs_owner_id', 'hs_csm_id']
             bq_df = master_df.drop(columns=[c for c in bq_drop_cols if c in master_df.columns]).copy()
             bq_df.columns = [c.replace(' ', '_') for c in bq_df.columns]
             bq_df['snapshot_date'] = pd.to_datetime('today').date()
 
-            # Delete today's rows before inserting — prevents duplicates on reruns
             from google.cloud import bigquery
             bq_client = bigquery.Client(project='support-467322')
             today = bq_df['snapshot_date'].iloc[0]
@@ -434,12 +509,12 @@ def run_v3_3_local():
             print(f"⚠️ BigQuery Mirroring failed, but CSV is safe! Error: {e}")
         # --- END BIGQUERY ---
 
-        send_slack_message(f"v3.3-LOCAL Success. Rows: {len(master_df)}", is_error=False)
+        send_slack_message(f"v3.2b-LOCAL Daily Account Usage Info captured. Rows: {len(master_df)}", is_error=False)
         print(f"🎉 SUCCESS! Aggregated: {len(master_df)} rows")
     else:
-        send_slack_message("v3.3-LOCAL: No files downloaded — check browser/session.", is_error=True)
+        send_slack_message("v3.2b-LOCAL: No files downloaded — check browser/session.", is_error=True)
         print("❌ No files downloaded.")
 
 
 if __name__ == "__main__":
-    run_v3_3_local()
+    run_v3_4_local()
