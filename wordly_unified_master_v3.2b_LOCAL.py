@@ -466,7 +466,16 @@ def run_v3_4_local():
         master_df['Consumed Last 30 Days'] = master_df.apply(
             lambda r: max(0, r['Consumed Mins'] - h30.get(r['MK'], 0)), axis=1
         )
-
+        from datetime import datetime, timedelta
+        cutoff_90 = datetime.now() - timedelta(days=90)
+        master_df['Consumed Last 7 Days'] = master_df.apply(
+            lambda r: 0 if pd.to_datetime(r['Last Used'], errors='coerce') < cutoff_90 
+            else r['Consumed Last 7 Days'], axis=1
+        )
+        master_df['Consumed Last 30 Days'] = master_df.apply(
+            lambda r: 0 if pd.to_datetime(r['Last Used'], errors='coerce') < cutoff_90 
+            else r['Consumed Last 30 Days'], axis=1
+        )
         ts = now.strftime('%Y-%m-%d')
         for col in ["Contact ID", "Company ID"]:
             master_df[col] = master_df[col].astype(str).str.replace(r'\.0$', '', regex=True).replace(['nan', 'None', ''], '')
