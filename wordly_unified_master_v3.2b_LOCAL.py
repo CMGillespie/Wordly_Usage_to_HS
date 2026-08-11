@@ -15,7 +15,7 @@ import json
 import pandas as pd
 import requests
 import shutil
-from datetime import datetime
+from datetime import datetime, timedelta
 from playwright.sync_api import sync_playwright
 import time
 
@@ -466,7 +466,7 @@ def run_v3_4_local():
         master_df['Consumed Last 30 Days'] = master_df.apply(
             lambda r: max(0, r['Consumed Mins'] - h30.get(r['MK'], 0)), axis=1
         )
-        from datetime import datetime, timedelta
+
         cutoff_90 = datetime.now() - timedelta(days=90)
         master_df['Consumed Last 7 Days'] = master_df.apply(
             lambda r: 0 if pd.to_datetime(r['Last Used'], errors='coerce') < cutoff_90 
