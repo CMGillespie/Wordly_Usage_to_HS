@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 # bq_to_hs_push.py
-# VERSION: 0.3.0
-# CHANGES FROM v0.2.0:
-#   - Logs failed CREATEs to BQ hs_push_errors table
-#   - Skips known unresolved errors on daily push (saves API calls)
-#   - Weekly reconciliation: runs on Monday, checks if errors have resolved in HubSpot
-#   - Fixed Slack message: SUCCESS unless errors > 200 or updated count drops significantly
-#   - Error table tracks first_seen and resolved_date for cycle time analytics
+# VERSION: 0.3.1
+# CHANGES FROM v0.3.0:
+#   - Changed BQ source to usage_with_account_name view (includes portal_account_name)
+#   - Passes portal_account_name as account_name on CREATE payloads
+#   - upsert_hs_record now accepts row_data for account_name lookup
 # MODES:
 #   python3 bq_to_hs_push.py --test           Push 10 records, validate, save revert backup
 #   python3 bq_to_hs_push.py --revert         Restore values from last test backup
@@ -27,7 +25,7 @@ HS_KEY_FILE = 'HS_Service_key.txt'
 OBJECT_TYPE = '2-58523979'
 PORTAL_ID = '5315820'
 BQ_PROJECT = 'support-467322'
-BQ_TABLE = 'wordly_usage_data.current_usage_clean'
+BQ_TABLE = 'wordly_usage_data.usage_with_account_name'
 BQ_ERRORS_TABLE = 'wordly_usage_data.hs_push_errors'
 REVERT_FILE = 'hs_push_revert_backup.json'
 PROGRESS_FILE = 'hs_push_progress.json'
@@ -94,13 +92,12 @@ def load_bq_data(limit=None):
 
 
 def load_known_errors():
-    """Load emails that are currently in the error table and unresolved."""
     try:
         import pandas_gbq
         query = f"""
             SELECT owner_email
             FROM `{BQ_PROJECT}.{BQ_ERRORS_TABLE}`
-            WHERE resolved = false
+            WHERE resolved = false AND fail_count >= 3
         """
         df = pandas_gbq.read_gbq(query, project_id=BQ_PROJECT)
         errors = set(df['owner_email'].str.lower().tolist())
@@ -112,45 +109,55 @@ def load_known_errors():
 
 
 def log_error_to_bq(email, name, error_msg):
-    """Log a failed CREATE to the error table if not already there."""
+    """Increment fail_count. Only mark as unresolved (skip) after 3 failures."""
     try:
-        import pandas_gbq
         from google.cloud import bigquery
+        import pandas_gbq
         bq_client = bigquery.Client(project=BQ_PROJECT)
 
         # Check if already in error table
-        check = bq_client.query(f"""
-            SELECT COUNT(*) as cnt
+        check = list(bq_client.query(f"""
+            SELECT fail_count, resolved
             FROM `{BQ_PROJECT}.{BQ_ERRORS_TABLE}`
             WHERE owner_email = '{email}' AND resolved = false
-        """).result()
+        """).result())
 
-        for row in check:
-            if row.cnt > 0:
-                return  # Already logged
-
-        # Insert new error
-        error_df = pd.DataFrame([{
-            'snapshot_date': date.today().isoformat(),
-            'owner_email': email,
-            'owner_name': name,
-            'error_message': error_msg[:500],
-            'resolved': False,
-            'first_seen': date.today().isoformat(),
-            'resolved_date': None
-        }])
-        pandas_gbq.to_gbq(
-            error_df,
-            BQ_ERRORS_TABLE,
-            project_id=BQ_PROJECT,
-            if_exists='append'
-        )
+        if check:
+            # Already in table — increment fail_count
+            current_count = check[0].fail_count or 1
+            new_count = current_count + 1
+            bq_client.query(f"""
+                UPDATE `{BQ_PROJECT}.{BQ_ERRORS_TABLE}`
+                SET fail_count = {new_count}, snapshot_date = '{date.today().isoformat()}'
+                WHERE owner_email = '{email}' AND resolved = false
+            """).result()
+            print(f"      ⚠️  {email}: fail {new_count}/3 — {'logging as skip' if new_count >= 3 else 'will retry'}")
+        else:
+            # First failure — insert with fail_count = 1, but NOT yet in skip list
+            # Only becomes a skip after 3 failures (resolved stays false but fail_count tracked)
+            import pandas as pd
+            error_df = pd.DataFrame([{
+                'snapshot_date': date.today().isoformat(),
+                'owner_email': email,
+                'owner_name': name,
+                'error_message': error_msg[:500],
+                'resolved': False,
+                'first_seen': date.today().isoformat(),
+                'resolved_date': None,
+                'fail_count': 1
+            }])
+            pandas_gbq.to_gbq(
+                error_df,
+                BQ_ERRORS_TABLE,
+                project_id=BQ_PROJECT,
+                if_exists='append'
+            )
+            print(f"      ⚠️  {email}: fail 1/3 — will retry tomorrow")
     except Exception as e:
         print(f"      ⚠️  Could not log error to BQ: {e}")
 
 
 def run_reconciliation(token):
-    """Check all unresolved errors against HubSpot. Mark resolved if found."""
     print(f"\n{'='*60}")
     print("RECONCILIATION — checking unresolved errors against HubSpot")
     print(f"{'='*60}\n")
@@ -182,7 +189,6 @@ def run_reconciliation(token):
             existing = search_hs_record(token, email)
 
             if existing:
-                # Found in HubSpot — mark resolved
                 bq_client.query(f"""
                     UPDATE `{BQ_PROJECT}.{BQ_ERRORS_TABLE}`
                     SET resolved = true, resolved_date = '{date.today().isoformat()}'
@@ -247,7 +253,7 @@ def search_hs_record(token, email):
     return None
 
 
-def upsert_hs_record(token, email, properties):
+def upsert_hs_record(token, email, properties, row_data=None):
     headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
     existing = search_hs_record(token, email)
 
@@ -261,10 +267,17 @@ def upsert_hs_record(token, email, properties):
         r = api_call_with_retry(do_patch)
         action = "UPDATED"
     else:
+        # CREATE — include account_name from portal data if available
+        create_properties = dict(properties)
+        if row_data is not None:
+            portal_account_name = row_data.get('portal_account_name')
+            if portal_account_name and str(portal_account_name) not in ('nan', 'None', ''):
+                create_properties['account_name'] = str(portal_account_name)
+
         def do_post():
             return requests.post(
                 f"https://api.hubapi.com/crm/v3/objects/{OBJECT_TYPE}",
-                headers=headers, json={"properties": properties}, timeout=20
+                headers=headers, json={"properties": create_properties}, timeout=20
             )
         r = api_call_with_retry(do_post)
         action = "CREATED"
@@ -337,7 +350,7 @@ def run_test(token, df):
         })
 
         props = build_properties(row.to_dict())
-        action, record_id, error = upsert_hs_record(token, email, props)
+        action, record_id, error = upsert_hs_record(token, email, props, row_data=row.to_dict())
         results.append({'email': email, 'action': action, 'record_id': record_id, 'error': error, 'props_sent': props})
 
         status = "✅" if action != "ERROR" else "❌"
@@ -427,7 +440,6 @@ def run_revert(token):
 
 
 def run_full(token, df, resume=False):
-    # Load known errors to skip
     known_errors = load_known_errors()
 
     start_batch = 1
@@ -482,16 +494,17 @@ def run_full(token, df, resume=False):
 
             props = build_properties(row.to_dict())
             try:
-                action, record_id, error = upsert_hs_record(token, email, props)
+                action, record_id, error = upsert_hs_record(token, email, props, row_data=row.to_dict())
                 if action == 'UPDATED':
                     total_updated += 1
                 elif action == 'CREATED':
                     total_created += 1
+                    print(f"      ✨ CREATED: {email}")
                 else:
                     total_errors += 1
                     print(f"      ❌ {email}: {error}")
                     log_error_to_bq(email, owner_name, error)
-                    known_errors.add(email)  # Don't retry in this run
+                    known_errors.add(email)
             except Exception as e:
                 total_errors += 1
                 print(f"      ❌ {email}: Exception — {e}")
@@ -505,15 +518,14 @@ def run_full(token, df, resume=False):
     if os.path.exists(PROGRESS_FILE):
         os.remove(PROGRESS_FILE)
 
-    summary = f"Push complete. Updated: {total_updated}, Created: {total_created}, New errors logged: {total_errors}, Skipped (known errors): {total_error_skipped}"
+    summary = f"Push complete. Updated: {total_updated}, Created: {total_created}, New errors logged: {total_errors}, Skipped (known errors): {total_error_skipped}, Skipped (apostrophe/blank): {total_skipped}"
     print(f"\n🎉 {summary}")
-    # Only flag as error if something genuinely went wrong
     is_error = total_updated < (total_records * 0.8)
     send_slack(summary, is_error=is_error)
 
 
 def main():
-    parser = argparse.ArgumentParser(description='BQ to HubSpot push v0.3.0')
+    parser = argparse.ArgumentParser(description='BQ to HubSpot push v0.3.1')
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument('--test', action='store_true')
     group.add_argument('--revert', action='store_true')
@@ -538,16 +550,19 @@ def main():
     if args.test:
         run_test(token, df)
     elif args.full:
-        # Auto-run reconciliation on Mondays
         if date.today().weekday() == 0:
             print("📅 Monday detected — running reconciliation first...")
             run_reconciliation(token)
 
         if not args.resume:
-            confirm = input(f"\n⚠️  This will push {len(df)} records to HubSpot. Type YES to confirm: ")
-            if confirm.strip() != 'YES':
-                print("Aborted.")
-                return
+            import sys
+            if sys.stdin.isatty():
+                confirm = input(f"\n⚠️  This will push {len(df)} records to HubSpot. Type YES to confirm: ")
+                if confirm.strip() != 'YES':
+                    print("Aborted.")
+                    return
+            else:
+                print(f"⚡ Running in non-interactive mode — proceeding automatically with {len(df)} records.")
         run_full(token, df, resume=args.resume)
 
 
