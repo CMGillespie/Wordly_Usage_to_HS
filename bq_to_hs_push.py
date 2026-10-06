@@ -1,7 +1,18 @@
 #!/usr/bin/env python3
 # bq_to_hs_push.py
-# VERSION: 0.3.1
-# CHANGES FROM v0.3.0:
+# VERSION: 0.3.2a
+# WRITTEN BY: Claude
+# ORIGIN: Project chat "Wordly Portal Data Analytics" (HS push watchdog work)
+# DATE WRITTEN: not recorded for v0.1.0 through v0.3.1 (original build in an earlier chat)
+# MODIFIED: 2026-10-06 (v0.3.2a, freshness watchdog)
+# CHANGES FROM v0.3.1:
+#   - Freshness watchdog runs FIRST in --full, before any BigQuery load or API call
+#   - Usage data 2+ days old: push is skipped and Slack alerts
+#   - Usage data older than 2 days: warning text is also written to every HubSpot card
+#   - Sessions data 24+ hours old: Slack alert only (switch SESSIONS_STALE_BLOCKS_PUSH to skip the push too)
+#   - Normal push clears data_freshness_warning on every record it updates
+#   - New --check mode: prints data freshness, changes nothing
+# CHANGES FROM v0.3.0 (v0.3.1):
 #   - Changed BQ source to usage_with_account_name view (includes portal_account_name)
 #   - Passes portal_account_name as account_name on CREATE payloads
 #   - upsert_hs_record now accepts row_data for account_name lookup
@@ -11,6 +22,7 @@
 #   python3 bq_to_hs_push.py --full           Full push (requires typing YES)
 #   python3 bq_to_hs_push.py --full --resume  Resume from last saved batch
 #   python3 bq_to_hs_push.py --reconcile      Force reconciliation run regardless of day
+#   python3 bq_to_hs_push.py --check          Dry run: print data freshness, change nothing
 
 import os
 import json
@@ -33,6 +45,15 @@ SLACK_KEY_FILE = 'slack_webhook.txt'
 BATCH_SIZE = 200
 MAX_RETRIES = 3
 RETRY_WAIT = 5
+
+# --- FRESHNESS WATCHDOG SETTINGS (v0.3.2a) ---
+USAGE_HISTORY_TABLE = 'wordly_usage_data.usage_history'
+SESSIONS_TABLE = 'wordly_session_data_central.sessions'
+WARNING_PROPERTY = 'data_freshness_warning'
+STALE_DAYS = 2                       # Usage data this old or older: skip the push and alert.
+WARN_AFTER_DAYS = 2                  # Usage data older than this: also write the warning on every HubSpot card.
+SESSIONS_STALE_HOURS = 24            # Sessions data this old or older: alert.
+SESSIONS_STALE_BLOCKS_PUSH = False   # False = alert only. True = also skip the push.
 
 FIELD_MAP = {
     'Owner_Name':            'owner_name',
@@ -493,6 +514,7 @@ def run_full(token, df, resume=False):
                 continue
 
             props = build_properties(row.to_dict())
+            props[WARNING_PROPERTY] = ''  # v0.3.2a: fresh data clears any old warning
             try:
                 action, record_id, error = upsert_hs_record(token, email, props, row_data=row.to_dict())
                 if action == 'UPDATED':
@@ -524,15 +546,143 @@ def run_full(token, df, resume=False):
     send_slack(summary, is_error=is_error)
 
 
+# --- START v0.3.2a: FRESHNESS WATCHDOG ---
+def _bq_scalar(sql):
+    """Run one BigQuery query and return the first value. Returns None on any error."""
+    try:
+        from google.cloud import bigquery
+        client = bigquery.Client(project=BQ_PROJECT)
+        rows = list(client.query(sql).result())
+        return rows[0][0] if rows else None
+    except Exception as e:
+        print(f"   ❌ Freshness check query failed: {e}")
+        return None
+
+
+def get_usage_age_days():
+    """Days since the newest snapshot_date in usage_history (Pacific time). None if unreadable."""
+    value = _bq_scalar(f"""
+        SELECT DATE_DIFF(
+            CURRENT_DATE("America/Los_Angeles"),
+            MAX(SAFE_CAST(snapshot_date AS DATE)),
+            DAY)
+        FROM `{BQ_PROJECT}.{USAGE_HISTORY_TABLE}`
+    """)
+    return int(value) if value is not None else None
+
+
+def get_sessions_age_hours():
+    """Hours since the newest _inserted_at in the central sessions table. None if unreadable."""
+    value = _bq_scalar(f"""
+        SELECT TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), MAX(SAFE_CAST(_inserted_at AS TIMESTAMP)), HOUR)
+        FROM `{BQ_PROJECT}.{SESSIONS_TABLE}`
+    """)
+    return int(value) if value is not None else None
+
+
+def write_warning_to_all(token, text):
+    """Write the warning text onto every Accounts Usage record. Returns True if all were updated."""
+    headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+    base = f"https://api.hubapi.com/crm/v3/objects/{OBJECT_TYPE}"
+
+    ids = []
+    after = None
+    while True:
+        params = {'limit': 100}
+        if after:
+            params['after'] = after
+        r = requests.get(base, headers=headers, params=params, timeout=30)
+        if r.status_code != 200:
+            print(f"   ❌ Could not list records: {r.status_code} {r.text[:200]}")
+            return False
+        data = r.json()
+        ids += [item['id'] for item in data.get('results', [])]
+        after = data.get('paging', {}).get('next', {}).get('after')
+        if not after:
+            break
+        time.sleep(0.1)
+    print(f"   📋 Found {len(ids)} records to mark")
+
+    updated = 0
+    for i in range(0, len(ids), 100):
+        chunk = ids[i:i + 100]
+        payload = {'inputs': [{'id': rid, 'properties': {WARNING_PROPERTY: text}} for rid in chunk]}
+        r = requests.post(f"{base}/batch/update", headers=headers, json=payload, timeout=60)
+        if r.status_code == 429:
+            time.sleep(10)
+            r = requests.post(f"{base}/batch/update", headers=headers, json=payload, timeout=60)
+        if r.status_code in (200, 201, 202):
+            updated += len(chunk)
+        else:
+            print(f"   ❌ Batch failed at record {i + 1}: {r.status_code} {r.text[:200]}")
+        time.sleep(0.2)
+
+    print(f"   ⚠️  Warning written to {updated} of {len(ids)} records")
+    return updated == len(ids)
+
+
+def run_watchdog(token):
+    """Check data freshness. Returns True to push, False to skip."""
+    print(f"\n{'='*60}")
+    print("FRESHNESS WATCHDOG")
+    print(f"{'='*60}")
+
+    usage_age = get_usage_age_days()
+    sessions_age = get_sessions_age_hours()
+    print(f"   Usage data age:    {usage_age} days (push skips at {STALE_DAYS}+)")
+    print(f"   Sessions data age: {sessions_age} hours (alert at {SESSIONS_STALE_HOURS}+)")
+
+    proceed = True
+
+    # Usage data: stale means skip. An unreadable date also means skip, so a broken check never pushes quietly.
+    if usage_age is None:
+        send_slack("Push SKIPPED. The usage data date could not be read. Check usage_history in BigQuery.", is_error=True)
+        return False
+
+    if usage_age >= STALE_DAYS:
+        send_slack(f"Push SKIPPED. Usage data is {usage_age} days old. Check the nightly scraper and the Friday cookie.", is_error=True)
+        if usage_age > WARN_AFTER_DAYS:
+            write_warning_to_all(token, f"⚠️ Data is {usage_age} days old")
+        proceed = False
+
+    # Sessions data: always alert. Skip the push only if the switch is on.
+    if sessions_age is None or sessions_age >= SESSIONS_STALE_HOURS:
+        detail = "could not be read" if sessions_age is None else f"is {sessions_age} hours old"
+        send_slack(f"Sessions data {detail}. Check the session scraper. New HubSpot records may fail until it recovers.", is_error=True)
+        if SESSIONS_STALE_BLOCKS_PUSH:
+            proceed = False
+
+    print(f"   Result: {'PUSH' if proceed else 'SKIP'}")
+    return proceed
+
+
+def run_freshness_check_only():
+    """Dry run for --check. Reads BigQuery only. No Slack, no HubSpot writes."""
+    usage_age = get_usage_age_days()
+    sessions_age = get_sessions_age_hours()
+    print(f"Usage data age:    {usage_age} days (push skips at {STALE_DAYS}+)")
+    print(f"Sessions data age: {sessions_age} hours (alert at {SESSIONS_STALE_HOURS}+)")
+    usage_ok = usage_age is not None and usage_age < STALE_DAYS
+    sessions_ok = sessions_age is not None and sessions_age < SESSIONS_STALE_HOURS
+    print(f"Usage check:    {'OK' if usage_ok else 'WOULD SKIP PUSH'}")
+    print(f"Sessions check: {'OK' if sessions_ok else 'WOULD ALERT'}")
+# --- END v0.3.2a: FRESHNESS WATCHDOG ---
+
+
 def main():
-    parser = argparse.ArgumentParser(description='BQ to HubSpot push v0.3.1')
+    parser = argparse.ArgumentParser(description='BQ to HubSpot push v0.3.2a')
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument('--test', action='store_true')
     group.add_argument('--revert', action='store_true')
     group.add_argument('--full', action='store_true')
     group.add_argument('--reconcile', action='store_true', help='Force reconciliation run')
+    group.add_argument('--check', action='store_true', help='Dry run: print data freshness, change nothing')
     parser.add_argument('--resume', action='store_true', help='Resume full push from last saved batch')
     args = parser.parse_args()
+
+    if args.check:
+        run_freshness_check_only()
+        return
 
     token = get_token()
 
@@ -542,6 +692,10 @@ def main():
 
     if args.reconcile:
         run_reconciliation(token)
+        return
+
+    # v0.3.2a: freshness check comes first. No fresh data, no push. Saves API calls.
+    if args.full and not run_watchdog(token):
         return
 
     print(f"📡 Loading BQ data...")
