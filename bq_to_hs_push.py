@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 # bq_to_hs_push.py
-# VERSION: 0.3.2a
+# VERSION: 0.3.2b
 # WRITTEN BY: Claude
 # ORIGIN: Project chat "Wordly Portal Data Analytics" (HS push watchdog work)
 # DATE WRITTEN: not recorded for v0.1.0 through v0.3.1 (original build in an earlier chat)
-# MODIFIED: 2026-10-06 (v0.3.2a, freshness watchdog)
-# CHANGES FROM v0.3.1:
+# MODIFIED: 2026-10-06 (v0.3.2a, freshness watchdog); 2026-10-09 (v0.3.2b, stale-card flag)
+# CHANGES FROM v0.3.2a:
+#   - Every updated card is stamped with data_as_of = tonight's date
+#   - After a healthy full push, any card NOT stamped tonight gets a warning in data_freshness_warning
+#   - Safety: scan runs only if 95%+ of attempted accounts updated; flags nothing if over 20% of cards look stale
+# CHANGES FROM v0.3.1 (v0.3.2a):
 #   - Freshness watchdog runs FIRST in --full, before any BigQuery load or API call
 #   - Usage data 2+ days old: push is skipped and Slack alerts
 #   - Usage data older than 2 days: warning text is also written to every HubSpot card
@@ -54,6 +58,11 @@ STALE_DAYS = 2                       # Usage data this old or older: skip the pu
 WARN_AFTER_DAYS = 2                  # Usage data older than this: also write the warning on every HubSpot card.
 SESSIONS_STALE_HOURS = 24            # Sessions data this old or older: alert.
 SESSIONS_STALE_BLOCKS_PUSH = False   # False = alert only. True = also skip the push.
+
+# --- STALE CARD FLAG SETTINGS (v0.3.2b) ---
+DATA_AS_OF_PROPERTY = 'data_as_of'
+STALE_SCAN_MIN_UPDATE_RATE = 0.95    # Scan runs only if this share of attempted accounts updated tonight.
+STALE_SCAN_MAX_FLAG_RATE = 0.20      # If more than this share of cards look stale, flag nothing and alert.
 
 FIELD_MAP = {
     'Owner_Name':            'owner_name',
@@ -462,6 +471,7 @@ def run_revert(token):
 
 def run_full(token, df, resume=False):
     known_errors = load_known_errors()
+    run_date = date.today().isoformat()  # v0.3.2b: stamp for data_as_of
 
     start_batch = 1
     total_updated = 0
@@ -515,6 +525,7 @@ def run_full(token, df, resume=False):
 
             props = build_properties(row.to_dict())
             props[WARNING_PROPERTY] = ''  # v0.3.2a: fresh data clears any old warning
+            props[DATA_AS_OF_PROPERTY] = run_date  # v0.3.2b: stamp the card as updated tonight
             try:
                 action, record_id, error = upsert_hs_record(token, email, props, row_data=row.to_dict())
                 if action == 'UPDATED':
@@ -544,6 +555,15 @@ def run_full(token, df, resume=False):
     print(f"\n🎉 {summary}")
     is_error = total_updated < (total_records * 0.8)
     send_slack(summary, is_error=is_error)
+
+    # v0.3.2b: flag cards that were not updated tonight, but only after a healthy push.
+    attempted = total_updated + total_created + total_errors
+    if resume:
+        print("   ℹ️  Stale-card scan skipped: this was a resumed run")
+    elif attempted > 0 and total_updated >= attempted * STALE_SCAN_MIN_UPDATE_RATE:
+        flag_stale_cards(token, run_date)
+    else:
+        print("   ⚠️ Stale-card scan skipped: too many failures tonight, so the result cannot be trusted")
 
 
 # --- START v0.3.2a: FRESHNESS WATCHDOG ---
@@ -669,8 +689,66 @@ def run_freshness_check_only():
 # --- END v0.3.2a: FRESHNESS WATCHDOG ---
 
 
+# --- START v0.3.2b: STALE CARD FLAG ---
+def flag_stale_cards(token, run_date):
+    """After a healthy full push, put a warning on every card that was not updated tonight."""
+    headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+    base = f"https://api.hubapi.com/crm/v3/objects/{OBJECT_TYPE}"
+
+    stale = []   # list of (record id, last data_as_of stamp or '')
+    total = 0
+    after = None
+    while True:
+        params = {'limit': 100, 'properties': f'{DATA_AS_OF_PROPERTY},{WARNING_PROPERTY}'}
+        if after:
+            params['after'] = after
+        r = requests.get(base, headers=headers, params=params, timeout=30)
+        if r.status_code != 200:
+            print(f"   ❌ Stale-card scan could not list records: {r.status_code} {r.text[:200]}")
+            return
+        data = r.json()
+        for item in data.get('results', []):
+            total += 1
+            stamp = (item.get('properties', {}).get(DATA_AS_OF_PROPERTY) or '').strip()
+            if stamp != run_date:
+                stale.append((item['id'], stamp))
+        after = data.get('paging', {}).get('next', {}).get('after')
+        if not after:
+            break
+        time.sleep(0.1)
+
+    print(f"   🔎 Stale-card scan: {len(stale)} of {total} cards were not updated tonight")
+
+    # Safety: if too many cards look stale, something is wrong with tonight's run. Flag nothing.
+    if total == 0 or len(stale) > total * STALE_SCAN_MAX_FLAG_RATE:
+        send_slack(f"Stale-card scan found {len(stale)} of {total} cards not updated tonight. That is over the safety limit, so no cards were flagged. Check the push log.", is_error=True)
+        return
+
+    flagged = 0
+    for i in range(0, len(stale), 100):
+        chunk = stale[i:i + 100]
+        inputs = []
+        for rid, stamp in chunk:
+            if stamp:
+                text = f"⚠️ Account not found in Wordly data since {stamp}"
+            else:
+                text = f"⚠️ Account not found in Wordly data (no update before {run_date})"
+            inputs.append({'id': rid, 'properties': {WARNING_PROPERTY: text}})
+        r = requests.post(f"{base}/batch/update", headers=headers, json={'inputs': inputs}, timeout=60)
+        if r.status_code == 429:
+            time.sleep(10)
+            r = requests.post(f"{base}/batch/update", headers=headers, json={'inputs': inputs}, timeout=60)
+        if r.status_code in (200, 201, 202):
+            flagged += len(chunk)
+        else:
+            print(f"   ❌ Flag batch failed at card {i + 1}: {r.status_code} {r.text[:200]}")
+        time.sleep(0.2)
+    print(f"   ⚠️  Flagged {flagged} stale cards")
+# --- END v0.3.2b: STALE CARD FLAG ---
+
+
 def main():
-    parser = argparse.ArgumentParser(description='BQ to HubSpot push v0.3.2a')
+    parser = argparse.ArgumentParser(description='BQ to HubSpot push v0.3.2b')
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument('--test', action='store_true')
     group.add_argument('--revert', action='store_true')
