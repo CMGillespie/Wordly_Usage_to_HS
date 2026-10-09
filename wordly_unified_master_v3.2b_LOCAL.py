@@ -1,8 +1,15 @@
 print("🚀 [HEARTBEAT] SCRIPT IS STARTING NOW...")
 # wordly_unified_master_v3.2b_LOCAL.py
-# VERSION: v3.4-LOCAL
+# VERSION: v3.4a-LOCAL
 # MACHINE: MacBook Air M1 — wordly_apps@Kirks-MacBook-Air
-# CHANGES FROM v3.3-LOCAL:
+# WRITTEN BY: Claude
+# ORIGIN: Project chat "Wordly Portal Data Analytics" (7-day usage fix)
+# DATE WRITTEN: not recorded for v3.2b through v3.4 (original build in earlier chats)
+# MODIFIED: 2026-10-09 (v3.4a, history lookup by email)
+# CHANGES FROM v3.4-LOCAL:
+#   - 7-day and 30-day usage now compare against old snapshots by EMAIL, not Contact ID
+#     (a Contact ID change made the old snapshot unfindable, so lifetime total showed as recent usage)
+# CHANGES FROM v3.3-LOCAL (v3.4):
 #   - Added customer_success_manager to company fetch → hs_csm column in BQ
 #   - Added associatedcompanyid to contacts fetch → fallback company lookup for unmatched domains
 #   - Added company_id → name/owner/csm maps for fallback resolution
@@ -198,11 +205,8 @@ def get_sanitized_history(target_days):
             if hdf[col].dtype == 'object':
                 hdf[col] = hdf[col].astype(str).str.strip()
 
-        if 'Contact_ID' in hdf.columns:
-            hdf['CID'] = hdf['Contact_ID'].astype(str).str.replace(r'\.0$', '', regex=True).replace(['nan', 'None', ''], pd.NA)
-            hdf['MK'] = hdf['CID'].fillna(hdf['Owner_Email'].str.lower())
-        else:
-            hdf['MK'] = hdf['Owner_Email'].str.lower()
+        # v3.4a: match history by email, not Contact ID. A Contact ID can change; the email does not.
+        hdf['MK'] = hdf['Owner_Email'].str.lower()
 
         return hdf.groupby('MK')['Consumed_Mins'].sum()
 
@@ -461,10 +465,10 @@ def run_v3_4_local():
         now = datetime.now()
         h7, h30 = get_sanitized_history(7), get_sanitized_history(30)
         master_df['Consumed Last 7 Days'] = master_df.apply(
-            lambda r: max(0, r['Consumed Mins'] - h7.get(r['MK'], 0)), axis=1
+            lambda r: max(0, r['Consumed Mins'] - h7.get(str(r['Owner Email']).lower(), 0)), axis=1
         )
         master_df['Consumed Last 30 Days'] = master_df.apply(
-            lambda r: max(0, r['Consumed Mins'] - h30.get(r['MK'], 0)), axis=1
+            lambda r: max(0, r['Consumed Mins'] - h30.get(str(r['Owner Email']).lower(), 0)), axis=1
         )
 
         cutoff_90 = datetime.now() - timedelta(days=90)
