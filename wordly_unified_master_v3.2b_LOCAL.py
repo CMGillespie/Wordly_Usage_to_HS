@@ -1,12 +1,23 @@
 print("🚀 [HEARTBEAT] SCRIPT IS STARTING NOW...")
-# wordly_unified_master_v3.2b_LOCAL.py
-# VERSION: v3.4a-LOCAL
+# wordly_unified_master_v3.5b_LOCAL.py  (live filename after the flip: wordly_unified_master_v3.2b_LOCAL.py)
+# VERSION: v3.5b-LOCAL
 # MACHINE: MacBook Air M1 — wordly_apps@Kirks-MacBook-Air
 # WRITTEN BY: Claude
-# ORIGIN: Project chat "Wordly Portal Data Analytics" (7-day usage fix)
+# ORIGIN: Project chat "Wordly Portal Data Analytics" (7-day usage fix; raw account table)
 # DATE WRITTEN: not recorded for v3.2b through v3.4 (original build in earlier chats)
-# MODIFIED: 2026-10-09 (v3.4a, history lookup by email)
-# CHANGES FROM v3.4-LOCAL:
+# MODIFIED: 2026-10-09 (v3.4a, history lookup by email); 2026-10-23 (v3.5a, raw account table; v3.5b, skip list and internal filter)
+# CHANGES FROM v3.5a-LOCAL:
+#   - Services skipped are now ONLY these, matched by exact name: All, Trial, Introductory, Wordly Internal, Wordly Workspace.
+#     The old rule skipped any service whose name merely CONTAINED Intro, Demo, Test, Free or Trial
+#     (so a customer service such as Freeman was skipped by mistake).
+#   - Accounts whose owner email ends in @wordly.ai are removed before anything else happens.
+#   - The run prints the list of skipped services so it can be checked against the portal dropdown.
+# CHANGES FROM v3.4a-LOCAL (v3.5a):
+#   - NEW TABLE wordly_usage_data.usage_accounts_raw: one row per account card, written BEFORE the
+#     per-email merge, with Account Name and Service kept on every row. snapshot_date delete-then-insert.
+#   - Nothing else changed: usage_history, the CSV, the Slack message and the HubSpot push work as before.
+#   - A failure writing the raw table prints a warning and does not stop the main run.
+# CHANGES FROM v3.4-LOCAL (v3.4a):
 #   - 7-day and 30-day usage now compare against old snapshots by EMAIL, not Contact ID
 #     (a Contact ID change made the old snapshot unfindable, so lifetime total showed as recent usage)
 # CHANGES FROM v3.3-LOCAL (v3.4):
@@ -40,7 +51,8 @@ WORDLY_CREDS = os.path.join(BASE_DIR, "wordly_creds.txt")
 HS_KEY_FILE = os.path.join(BASE_DIR, "HS_Service_key.txt")
 SLACK_KEY_FILE = os.path.join(BASE_DIR, "slack_webhook.txt")
 
-EXCLUSION_KEYWORDS = ["Trial", "Intro", "Demo", "Test", "Free", "Wordly Internal"]
+# Services to skip, matched by EXACT name (lowercase compare). Nothing else is skipped.
+SKIP_SERVICES = {"all", "trial", "introductory", "wordly internal", "wordly workspace"}
 
 GENERIC_SERVICES = {
     'Active', 'Restricted', 'Trial', 'SMB Bronze', 'SMB Silver',
@@ -285,13 +297,17 @@ def run_v3_4_local():
         options = page.locator(".p-dropdown-item")
 
         targets = []
+        skipped = []
         for i in range(options.count()):
             name = options.nth(i).inner_text().strip()
-            if name != "All" and not any(kw.lower() in name.lower() for kw in EXCLUSION_KEYWORDS):
+            if name.lower() in SKIP_SERVICES:
+                skipped.append(name)
+            else:
                 targets.append(name)
 
         page.keyboard.press("Escape")
         print(f"   📋 Services found: {targets}")
+        print(f"   🚫 Skipping: {skipped}")
 
         for service in targets:
             try:
@@ -324,6 +340,11 @@ def run_v3_4_local():
     if downloaded_files:
         master_df = pd.concat([pd.read_csv(f) for f in downloaded_files], ignore_index=True)
         print(f"   📊 Raw rows before aggregation: {len(master_df)}")
+        # v3.5b: drop Wordly's own accounts before anything else
+        rows_before = len(master_df)
+        master_df = master_df[~master_df['Owner Email'].astype(str).str.lower().str.endswith('@wordly.ai')].reset_index(drop=True)
+        print(f"   🚫 Excluded {rows_before - len(master_df)} internal @wordly.ai account rows")
+        raw_df = master_df.copy()  # v3.5a: one row per account card, before the per-email merge
         for f in downloaded_files:
             os.remove(f)
 
@@ -521,6 +542,36 @@ def run_v3_4_local():
         except Exception as e:
             print(f"⚠️ BigQuery Mirroring failed, but CSV is safe! Error: {e}")
         # --- END BIGQUERY ---
+
+        # --- BIGQUERY: RAW ACCOUNT CARDS (v3.5a) ---
+        try:
+            import pandas_gbq
+            from google.cloud import bigquery
+
+            raw_out = raw_df.copy()
+            raw_out.columns = [c.replace(' ', '_') for c in raw_out.columns]
+            raw_today = pd.to_datetime('today').date()
+            raw_out['snapshot_date'] = raw_today
+
+            raw_client = bigquery.Client(project='support-467322')
+            try:
+                raw_client.query(f"""
+                    DELETE FROM `support-467322.wordly_usage_data.usage_accounts_raw`
+                    WHERE snapshot_date = '{raw_today}'
+                """).result()
+            except Exception:
+                pass  # the table does not exist yet on the first run
+
+            pandas_gbq.to_gbq(
+                raw_out,
+                'wordly_usage_data.usage_accounts_raw',
+                project_id='support-467322',
+                if_exists='append'
+            )
+            print(f"🧾 Raw account cards saved: {len(raw_out)} rows")
+        except Exception as e:
+            print(f"⚠️ Raw account table failed (main data is safe): {e}")
+        # --- END BIGQUERY: RAW ACCOUNT CARDS ---
 
         send_slack_message(f"v3.2b-LOCAL Daily Account Usage Info captured. Rows: {len(master_df)}", is_error=False)
         print(f"🎉 SUCCESS! Aggregated: {len(master_df)} rows")
