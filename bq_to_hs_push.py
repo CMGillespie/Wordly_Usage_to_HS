@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
 # bq_to_hs_push.py
-# VERSION: 0.3.2b
+# VERSION: 0.3.2d
 # WRITTEN BY: Claude
 # ORIGIN: Project chat "Wordly Portal Data Analytics" (HS push watchdog work)
 # DATE WRITTEN: not recorded for v0.1.0 through v0.3.1 (original build in an earlier chat)
-# MODIFIED: 2026-10-06 (v0.3.2a, freshness watchdog); 2026-10-09 (v0.3.2b, stale-card flag)
-# CHANGES FROM v0.3.2a:
+# MODIFIED: 2026-10-06 (v0.3.2a, freshness watchdog); 2026-10-09 (v0.3.2b, stale-card flag); 2026-10-26 (v0.3.2c, ignore @wordly.ai in stale-card scan; v0.3.2d, new-card cap)
+# CHANGES FROM v0.3.2c:
+#   - New-card cap: at most MAX_CREATES_PER_RUN new cards are attempted per run (default 50).
+#     Accounts held back are NOT logged as errors and are retried the next night.
+#   - The Slack summary now also shows how many accounts were held back by the cap.
+# CHANGES FROM v0.3.2b (v0.3.2c):
+#   - Stale-card scan ignores cards whose owner email ends in @wordly.ai: they are not counted and not flagged
+#     (the scraper removes internal accounts on purpose, so they would always look stale).
+# CHANGES FROM v0.3.2a (v0.3.2b):
 #   - Every updated card is stamped with data_as_of = tonight's date
 #   - After a healthy full push, any card NOT stamped tonight gets a warning in data_freshness_warning
 #   - Safety: scan runs only if 95%+ of attempted accounts updated; flags nothing if over 20% of cards look stale
@@ -63,6 +70,10 @@ SESSIONS_STALE_BLOCKS_PUSH = False   # False = alert only. True = also skip the 
 DATA_AS_OF_PROPERTY = 'data_as_of'
 STALE_SCAN_MIN_UPDATE_RATE = 0.95    # Scan runs only if this share of attempted accounts updated tonight.
 STALE_SCAN_MAX_FLAG_RATE = 0.20      # If more than this share of cards look stale, flag nothing and alert.
+
+# --- NEW CARD CAP (v0.3.2d) ---
+MAX_CREATES_PER_RUN = 50             # New cards attempted per run. Raise it once the first cards look right.
+_create_attempts = 0                 # Counts new-card attempts in this run. Do not edit.
 
 FIELD_MAP = {
     'Owner_Name':            'owner_name',
@@ -284,6 +295,7 @@ def search_hs_record(token, email):
 
 
 def upsert_hs_record(token, email, properties, row_data=None):
+    global _create_attempts
     headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
     existing = search_hs_record(token, email)
 
@@ -297,6 +309,11 @@ def upsert_hs_record(token, email, properties, row_data=None):
         r = api_call_with_retry(do_patch)
         action = "UPDATED"
     else:
+        # v0.3.2d: stop at the cap. The account is retried tomorrow and is not logged as an error.
+        if _create_attempts >= MAX_CREATES_PER_RUN:
+            return "HELD_BY_CAP", None, None
+        _create_attempts += 1
+
         # CREATE — include account_name from portal data if available
         create_properties = dict(properties)
         if row_data is not None:
@@ -479,6 +496,7 @@ def run_full(token, df, resume=False):
     total_errors = 0
     total_skipped = 0
     total_error_skipped = 0
+    total_cap_skipped = 0  # v0.3.2d: accounts held back by the new-card cap
 
     if resume:
         progress = load_progress()
@@ -533,6 +551,8 @@ def run_full(token, df, resume=False):
                 elif action == 'CREATED':
                     total_created += 1
                     print(f"      ✨ CREATED: {email}")
+                elif action == 'HELD_BY_CAP':
+                    total_cap_skipped += 1
                 else:
                     total_errors += 1
                     print(f"      ❌ {email}: {error}")
@@ -551,7 +571,7 @@ def run_full(token, df, resume=False):
     if os.path.exists(PROGRESS_FILE):
         os.remove(PROGRESS_FILE)
 
-    summary = f"Push complete. Updated: {total_updated}, Created: {total_created}, New errors logged: {total_errors}, Skipped (known errors): {total_error_skipped}, Skipped (apostrophe/blank): {total_skipped}"
+    summary = f"Push complete. Updated: {total_updated}, Created: {total_created}, New errors logged: {total_errors}, Skipped (known errors): {total_error_skipped}, Skipped (apostrophe/blank): {total_skipped}, Held back by new-card cap: {total_cap_skipped}"
     print(f"\n🎉 {summary}")
     is_error = total_updated < (total_records * 0.8)
     send_slack(summary, is_error=is_error)
@@ -697,9 +717,10 @@ def flag_stale_cards(token, run_date):
 
     stale = []   # list of (record id, last data_as_of stamp or '')
     total = 0
+    internal_ignored = 0
     after = None
     while True:
-        params = {'limit': 100, 'properties': f'{DATA_AS_OF_PROPERTY},{WARNING_PROPERTY}'}
+        params = {'limit': 100, 'properties': f'{DATA_AS_OF_PROPERTY},{WARNING_PROPERTY},owner_email'}
         if after:
             params['after'] = after
         r = requests.get(base, headers=headers, params=params, timeout=30)
@@ -708,6 +729,10 @@ def flag_stale_cards(token, run_date):
             return
         data = r.json()
         for item in data.get('results', []):
+            owner_email = (item.get('properties', {}).get('owner_email') or '').strip().lower()
+            if owner_email.endswith('@wordly.ai'):
+                internal_ignored += 1   # internal accounts are removed on purpose; never count or flag them
+                continue
             total += 1
             stamp = (item.get('properties', {}).get(DATA_AS_OF_PROPERTY) or '').strip()
             if stamp != run_date:
@@ -717,7 +742,7 @@ def flag_stale_cards(token, run_date):
             break
         time.sleep(0.1)
 
-    print(f"   🔎 Stale-card scan: {len(stale)} of {total} cards were not updated tonight")
+    print(f"   🔎 Stale-card scan: {len(stale)} of {total} cards were not updated tonight ({internal_ignored} internal @wordly.ai cards ignored)")
 
     # Safety: if too many cards look stale, something is wrong with tonight's run. Flag nothing.
     if total == 0 or len(stale) > total * STALE_SCAN_MAX_FLAG_RATE:
