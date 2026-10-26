@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 # bq_to_hs_push.py
-# VERSION: 0.3.2d
+# VERSION: 0.3.3a
 # WRITTEN BY: Claude
 # ORIGIN: Project chat "Wordly Portal Data Analytics" (HS push watchdog work)
 # DATE WRITTEN: not recorded for v0.1.0 through v0.3.1 (original build in an earlier chat)
-# MODIFIED: 2026-10-06 (v0.3.2a, freshness watchdog); 2026-10-09 (v0.3.2b, stale-card flag); 2026-10-26 (v0.3.2c, ignore @wordly.ai in stale-card scan; v0.3.2d, new-card cap)
-# CHANGES FROM v0.3.2c:
+# MODIFIED: 2026-10-06 (v0.3.2a, freshness watchdog); 2026-10-09 (v0.3.2b, stale-card flag); 2026-10-26 (v0.3.2c, ignore @wordly.ai in stale-card scan; v0.3.2d, new-card cap); 2026-10-26 (v0.3.3a, link new cards to contact and company)
+# CHANGES FROM v0.3.2d:
+#   - After the push creates a card, it links the card to the existing HubSpot contact with the same email,
+#     and to that contact's primary company. It NEVER creates a contact or a company.
+#     No contact found (or more than one match) = the card stays unlinked and the log says so.
+#   - The Slack summary now also shows how many new cards were linked to a contact.
+# CHANGES FROM v0.3.2c (v0.3.2d):
 #   - New-card cap: at most MAX_CREATES_PER_RUN new cards are attempted per run (default 50).
 #     Accounts held back are NOT logged as errors and are retried the next night.
 #   - The Slack summary now also shows how many accounts were held back by the cap.
@@ -335,6 +340,57 @@ def upsert_hs_record(token, email, properties, row_data=None):
         return "ERROR", None, f"{r.status_code}: {r.text[:200]}"
 
 
+# --- START v0.3.3a: LINK NEW CARDS ---
+def find_contact_id(token, email):
+    """Return the contact id when exactly one contact has this email. Otherwise None."""
+    headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+    payload = {"filterGroups": [{"filters": [{"propertyName": "email", "operator": "EQ", "value": email}]}],
+               "properties": ["email"], "limit": 2}
+    r = requests.post("https://api.hubapi.com/crm/v3/objects/contacts/search", headers=headers, json=payload, timeout=20)
+    if r.status_code != 200:
+        return None
+    results = r.json().get('results', [])
+    return results[0]['id'] if len(results) == 1 else None
+
+
+def find_primary_company_id(token, contact_id):
+    """Return the contact's primary company id. If there is no primary, use the only company. Otherwise None."""
+    headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+    r = requests.get(f"https://api.hubapi.com/crm/v4/objects/contacts/{contact_id}/associations/companies",
+                     headers=headers, timeout=20)
+    if r.status_code != 200:
+        return None
+    results = r.json().get('results', [])
+    for item in results:
+        if any(t.get('typeId') == 1 for t in item.get('associationTypes', [])):
+            return str(item.get('toObjectId'))
+    if len(results) == 1:
+        return str(results[0].get('toObjectId'))
+    return None
+
+
+def link_new_card(token, record_id, email):
+    """Link a new card to its contact and company. Returns (contact_linked, company_linked). Never raises."""
+    try:
+        headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+        contact_id = find_contact_id(token, email)
+        if not contact_id:
+            return False, False
+        base = f"https://api.hubapi.com/crm/v4/objects/{OBJECT_TYPE}/{record_id}/associations/default"
+        r = requests.put(f"{base}/contacts/{contact_id}", headers=headers, timeout=20)
+        contact_ok = r.status_code in (200, 201)
+        company_ok = False
+        company_id = find_primary_company_id(token, contact_id)
+        if company_id:
+            r2 = requests.put(f"{base}/companies/{company_id}", headers=headers, timeout=20)
+            company_ok = r2.status_code in (200, 201)
+        return contact_ok, company_ok
+    except Exception as e:
+        print(f"         ⚠️ Linking failed for {email}: {e}")
+        return False, False
+# --- END v0.3.3a: LINK NEW CARDS ---
+
+
 def build_properties(row):
     props = {}
     for bq_col, hs_field in FIELD_MAP.items():
@@ -497,6 +553,7 @@ def run_full(token, df, resume=False):
     total_skipped = 0
     total_error_skipped = 0
     total_cap_skipped = 0  # v0.3.2d: accounts held back by the new-card cap
+    total_linked = 0       # v0.3.3a: new cards linked to a contact
 
     if resume:
         progress = load_progress()
@@ -551,6 +608,10 @@ def run_full(token, df, resume=False):
                 elif action == 'CREATED':
                     total_created += 1
                     print(f"      ✨ CREATED: {email}")
+                    contact_ok, company_ok = link_new_card(token, record_id, email)
+                    if contact_ok:
+                        total_linked += 1
+                    print(f"         🔗 contact: {'linked' if contact_ok else 'none found'} | company: {'linked' if company_ok else 'none found'}")
                 elif action == 'HELD_BY_CAP':
                     total_cap_skipped += 1
                 else:
@@ -571,7 +632,7 @@ def run_full(token, df, resume=False):
     if os.path.exists(PROGRESS_FILE):
         os.remove(PROGRESS_FILE)
 
-    summary = f"Push complete. Updated: {total_updated}, Created: {total_created}, New errors logged: {total_errors}, Skipped (known errors): {total_error_skipped}, Skipped (apostrophe/blank): {total_skipped}, Held back by new-card cap: {total_cap_skipped}"
+    summary = f"Push complete. Updated: {total_updated}, Created: {total_created}, New errors logged: {total_errors}, Skipped (known errors): {total_error_skipped}, Skipped (apostrophe/blank): {total_skipped}, Held back by new-card cap: {total_cap_skipped}, New cards linked to a contact: {total_linked}"
     print(f"\n🎉 {summary}")
     is_error = total_updated < (total_records * 0.8)
     send_slack(summary, is_error=is_error)
