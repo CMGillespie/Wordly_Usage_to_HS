@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 # bq_to_hs_push.py
-# VERSION: 0.3.3a
+# VERSION: 0.3.3b
 # WRITTEN BY: Claude
 # ORIGIN: Project chat "Wordly Portal Data Analytics" (HS push watchdog work)
 # DATE WRITTEN: not recorded for v0.1.0 through v0.3.1 (original build in an earlier chat)
-# MODIFIED: 2026-10-06 (v0.3.2a, freshness watchdog); 2026-10-09 (v0.3.2b, stale-card flag); 2026-10-26 (v0.3.2c, ignore @wordly.ai in stale-card scan; v0.3.2d, new-card cap); 2026-10-26 (v0.3.3a, link new cards to contact and company)
-# CHANGES FROM v0.3.2d:
+# MODIFIED: 2026-10-06 (v0.3.2a, freshness watchdog); 2026-10-09 (v0.3.2b, stale-card flag); 2026-10-26 (v0.3.2c, ignore @wordly.ai in stale-card scan; v0.3.2d, new-card cap); 2026-10-26 (v0.3.3a, link new cards to contact and company); 2026-10-26 (v0.3.3b, adjustable cap, newest usage first)
+# CHANGES FROM v0.3.3a:
+#   - The new-card cap can be changed WITHOUT a redeploy: set the MAX_CREATES_PER_RUN environment variable
+#     on the Cloud Run job. The default stays 50 when the variable is not set.
+#   - The push now goes through accounts with the MOST RECENT usage first, so when the cap holds accounts back,
+#     the customers who used Wordly most recently get their cards first.
+#   - The run prints the cap it is using.
+# CHANGES FROM v0.3.2d (v0.3.3a):
 #   - After the push creates a card, it links the card to the existing HubSpot contact with the same email,
 #     and to that contact's primary company. It NEVER creates a contact or a company.
 #     No contact found (or more than one match) = the card stays unlinked and the log says so.
@@ -77,7 +83,7 @@ STALE_SCAN_MIN_UPDATE_RATE = 0.95    # Scan runs only if this share of attempted
 STALE_SCAN_MAX_FLAG_RATE = 0.20      # If more than this share of cards look stale, flag nothing and alert.
 
 # --- NEW CARD CAP (v0.3.2d) ---
-MAX_CREATES_PER_RUN = 50             # New cards attempted per run. Raise it once the first cards look right.
+MAX_CREATES_PER_RUN = int(os.environ.get('MAX_CREATES_PER_RUN', '50'))  # New cards attempted per run. Set the env var on the Cloud Run job to change it.
 _create_attempts = 0                 # Counts new-card attempts in this run. Do not edit.
 
 FIELD_MAP = {
@@ -545,6 +551,13 @@ def run_revert(token):
 def run_full(token, df, resume=False):
     known_errors = load_known_errors()
     run_date = date.today().isoformat()  # v0.3.2b: stamp for data_as_of
+    print(f"   New-card cap this run: {MAX_CREATES_PER_RUN}")
+
+    # v0.3.3b: most recent usage first, so the cap holds back the least recently used accounts.
+    df = (df.assign(_last_used_sort=pd.to_datetime(df['Last_Used'], format='%m/%d/%Y', errors='coerce'))
+            .sort_values('_last_used_sort', ascending=False, kind='stable', na_position='last')
+            .drop(columns=['_last_used_sort'])
+            .reset_index(drop=True))
 
     start_batch = 1
     total_updated = 0
